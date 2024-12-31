@@ -1,0 +1,12 @@
+[project]
+name = "cut-cross-entropy-mlx"
+version = "0.1.0"
+description = "Cut Cross-Entropy (arXiv:2411.09009) in MLX: streaming, chunked cross-entropy that never materialises the logits matrix"
+requires-python = ">=3.10"
+dependencies = ["mlx>=0.22", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
