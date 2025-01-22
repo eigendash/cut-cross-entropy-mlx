@@ -195,7 +195,11 @@ def _per_token_loss(
     ignore = targets == ignore_index
     target_logits = mx.where(ignore, mx.zeros_like(target_logits), target_logits)
     _, per_token = cross_entropy_from_lse(lse, target_logits, ignore)
-    return per_token
+    # A token whose entire vocabulary is -inf has no distribution to score. The
+    # naive path produces 0 - (-inf) = +inf there; report 0 instead, which keeps
+    # an all -inf classifier matrix from poisoning the loss.
+    finite = mx.isfinite(lse)
+    return mx.where(finite, per_token, mx.zeros_like(per_token))
 
 
 @mx.custom_function
@@ -233,6 +237,9 @@ def _chunked_linear_ce_vjp(primals, cotangents, outputs):
     eps = float(threshold)
     ignore = targets == ignore_index
     lse, summaries = _chunked_lse(hidden, head, chunk_size, reduction)
+    # Rows with no finite logit have no softmax; use 0 so exp() stays finite
+    # there. Their per-token loss is pinned to 0 above, so this is consistent.
+    softmax_lse = mx.where(mx.isfinite(lse), lse, mx.zeros_like(lse))
 
     # The cotangent arriving here is already the mean over non-ignored tokens,
     # so the only extra weighting is the ignore mask itself.
@@ -251,10 +258,11 @@ def _chunked_linear_ce_vjp(primals, cotangents, outputs):
     start = 0
     while start < vocab:
         stop = min(start + chunk_size, vocab)
-        chunk = (hidden @ head[start:stop].T).astype(mx.float32)
+        cols = head[start:stop]
+        chunk = (hidden @ cols.T).astype(mx.float32)
         # S_i = softmax(logits_i), recovered from the stored log-sum-exp without
         # recomputing the normaliser.
-        s = mx.exp(chunk - lse[:, None])
+        s = mx.exp(chunk - softmax_lse[:, None])
         if eps > 0.0:
             # Block-level skip, as in the paper: a chunk all of whose softmax
             # weights are below the threshold contributes nothing to either
@@ -268,7 +276,9 @@ def _chunked_linear_ce_vjp(primals, cotangents, outputs):
             s = mx.where(negligible, mx.zeros_like(s), s)
         skipped.append(False)
         weighted = s * coeff[:, None]
-        grad_hidden = grad_hidden + weighted @ head[start:stop]
+        # In-place accumulation, so the backward graph does not keep one buffer
+        # per chunk alive at once.
+        grad_hidden += weighted @ cols
         # Each chunk only ever writes its own column range of the head gradient,
         # so no full-size softmax matrix is needed to scatter into it.
         grad_head[start:stop] = weighted.T @ hidden
@@ -280,7 +290,7 @@ def _chunked_linear_ce_vjp(primals, cotangents, outputs):
             local = safe_targets - start
             one_hot = mx.arange(stop - start)[None, :] == local[:, None]
             scatter = (one_hot.astype(mx.float32) * coeff[:, None]) * in_chunk[:, None]
-            grad_head[start:stop] = grad_head[start:stop] - scatter.T @ hidden
+            grad_head[start:stop] -= scatter.T @ hidden
         start = stop
 
     global _LAST_FILTER_REPORT
@@ -331,6 +341,13 @@ def chunked_linear_cross_entropy(
         accumulated into either gradient. ``0.0`` disables the skip.
     """
     _check_inputs(hidden, head, targets)
+    if reduction not in REDUCTIONS:
+        raise ValueError(f"reduction must be one of {REDUCTIONS}, got {reduction!r}")
+    if reduction == "fused" and chunk_size > MAX_FUSED_BLOCK:
+        raise ValueError(
+            f"reduction='fused' handles at most {MAX_FUSED_BLOCK} columns per chunk, "
+            f"got {chunk_size}; use reduction='mlx' or a smaller chunk_size"
+        )
     per_token = _chunked_linear_ce_op(
         hidden,
         head,
