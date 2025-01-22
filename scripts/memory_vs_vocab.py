@@ -26,6 +26,7 @@ import gc
 import json
 import platform
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -126,6 +127,28 @@ def measure(fn, hidden: mx.array, head: mx.array, warmup: int = 3) -> dict[str, 
     }
 
 
+def measure_in_subprocess(vocab: int, tokens: int, path: str, chunk_size=None, reduction=None) -> dict:
+    """Run one measurement in a fresh interpreter and return its numbers."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--worker-path",
+        path,
+        "--worker-vocab",
+        str(vocab),
+        "--worker-tokens",
+        str(tokens),
+    ]
+    if chunk_size is not None:
+        command += ["--worker-chunk", str(chunk_size)]
+    if reduction is not None:
+        command += ["--worker-reduction", reduction]
+    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    line = [ln for ln in completed.stdout.splitlines() if ln.startswith("{")][-1]
+    return json.loads(line)
+
+
 def equality_section(log: Logger, vocabularies, chunk_sizes) -> list[dict]:
     """Loss and gradient equality between the two paths."""
     rows: list[dict] = []
@@ -219,13 +242,65 @@ def training_section(log: Logger, vocab: int, steps: int, seed: int = 0) -> dict
     return results
 
 
+def _worker(args) -> int:
+    """Measure one configuration in a fresh process and print it as JSON.
+
+    ``mx.get_peak_memory()`` is a high-water mark over a process lifetime and is
+    sensitive to whatever the allocator and the buffer cache were doing before
+    the call. Rather than warm the process up in a specific order and hope, each
+    measurement here runs in its own interpreter, so the numbers do not depend
+    on the order the table is filled in.
+    """
+    mx.random.seed(args.worker_vocab)
+    head = mx.random.normal(shape=(args.worker_vocab, D_MODEL)) * 0.02
+    hidden, targets = make_batch(D_MODEL, args.worker_vocab, args.worker_tokens, seed=args.worker_vocab)
+    mx.eval(head)
+
+    if args.worker_path == "naive":
+        def fn(h, c):
+            return naive_linear_cross_entropy(h, c, targets)[0]
+        chunk_size, reduction = None, None
+    else:
+        chunk_size, reduction = args.worker_chunk, args.worker_reduction
+
+        def fn(h, c):
+            return chunked_linear_cross_entropy(
+                h, c, targets, chunk_size=chunk_size, reduction=reduction
+            )[0]
+
+    stats = measure(fn, hidden, head)
+    stats.update(
+        {
+            "vocab": args.worker_vocab,
+            "tokens": args.worker_tokens,
+            "path": args.worker_path,
+            "chunk_size": chunk_size,
+            "reduction": reduction,
+        }
+    )
+    print(json.dumps(stats))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="results", help="directory for the result files")
     parser.add_argument("--quick", action="store_true", help="small sweep, for a smoke run")
     parser.add_argument("--steps", type=int, default=40, help="training steps in the liveness check")
     parser.add_argument("--max-vocab", type=int, default=131072)
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-path", default="naive", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-vocab", type=int, default=8192, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-tokens", type=int, default=256, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-chunk", type=int, default=1024, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-reduction", default="fused", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--max-tokens", type=int, default=8192, help="largest token count in the scaling sweep"
+    )
     args = parser.parse_args()
+
+    if args.worker:
+        return _worker(args)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -237,6 +312,9 @@ def main() -> int:
         vocabularies = [8192, 32768]
     # (reduction, chunk_size) pairs for the memory sweep.
     chunk_sizes = [(256, "fused"), (1024, "fused"), (4096, "mlx")]
+    token_counts = [256, 2048, args.max_tokens] if not args.quick else [256, 2048]
+    token_counts = sorted(set(t for t in token_counts if t <= args.max_tokens))
+    token_vocabs = [16384, 65536] if not args.quick else [16384]
     equality_vocabs = [8192, 32768] if not args.quick else [8192]
     equality_chunks = [64, 256, 1024, 8192] if not args.quick else [64, 1024, 8192]
 
@@ -259,39 +337,17 @@ def main() -> int:
 
     log("== 2. peak memory and wall clock vs vocabulary ==")
     memory: list[dict] = []
-    header = f"  {'|V|':>8} {'path':>18} {'peak MB':>10} {'active MB':>10} {'ms':>9}  vs naive peak"
-    log(header)
+    log(f"  {'|V|':>8} {'path':>18} {'peak MB':>10} {'active MB':>10} {'ms':>9}  vs naive peak")
     for vocab in vocabularies:
-        model = make_model(vocab, D_MODEL, seed=vocab)
-        hidden, targets = make_batch(D_MODEL, vocab, TOKENS, seed=vocab)
-        head = model.head.weight
-
-        def naive_fn(h, c, targets=targets):
-            return naive_linear_cross_entropy(h, c, targets)[0]
-
-        naive_stats = measure(naive_fn, hidden, head)
-        naive_stats.update({"vocab": vocab, "path": "naive", "chunk_size": None, "reduction": None})
+        naive_stats = measure_in_subprocess(vocab, TOKENS, "naive")
         memory.append(naive_stats)
         log(
             f"  {vocab:>8} {'naive (materialise)':>18} {naive_stats['peak_mb']:>10.2f} "
             f"{naive_stats['active_mb']:>10.2f} {naive_stats['ms']:>9.2f}  1.00x"
         )
         for chunk_size, reduction in chunk_sizes:
-            def chunked_fn(h, c, chunk_size=chunk_size, reduction=reduction, targets=targets):
-                return chunked_linear_cross_entropy(
-                    h, c, targets, chunk_size=chunk_size, reduction=reduction
-                )[0]
-
-            stats = measure(chunked_fn, hidden, head)
-            stats.update(
-                {
-                    "vocab": vocab,
-                    "path": "chunked",
-                    "chunk_size": chunk_size,
-                    "reduction": reduction,
-                    "naive_peak_mb": naive_stats["peak_mb"],
-                }
-            )
+            stats = measure_in_subprocess(vocab, TOKENS, "chunked", chunk_size, reduction)
+            stats["naive_peak_mb"] = naive_stats["peak_mb"]
             memory.append(stats)
             label = f"chunked/{reduction[:4]}/{chunk_size}"
             log(
@@ -337,7 +393,25 @@ def main() -> int:
         )
     log("")
 
-    log("== 3. gradient filtering (paper Section 4.2) ==")
+    log("== 3. peak memory and wall clock vs token count ==")
+    log("  (fixed |V|; the chunked path's advantage should grow with the batch)")
+    token_rows: list[dict] = []
+    for tokens in token_counts:
+        for vocab in token_vocabs:
+            naive_stats = measure_in_subprocess(vocab, tokens, "naive")
+            token_rows.append(naive_stats)
+            stats = measure_in_subprocess(vocab, tokens, "chunked", 1024, "fused")
+            token_rows.append(stats)
+            logits_mb = tokens * vocab * 4 / 1e6
+            log(
+                f"  tokens={tokens:>6} |V|={vocab:>7} logits={logits_mb:>8.1f} MB  "
+                f"naive {naive_stats['peak_mb']:>8.1f} MB {naive_stats['ms']:>8.1f} ms  "
+                f"chunked {stats['peak_mb']:>8.1f} MB {stats['ms']:>8.1f} ms  "
+                f"ratio {stats['peak_mb'] / naive_stats['peak_mb']:.2f}x"
+            )
+    log("")
+
+    log("== 4. gradient filtering (paper Section 4.2) ==")
     filter_vocab = 32768
     model = make_model(filter_vocab, D_MODEL, seed=filter_vocab)
     head = model.head.weight
@@ -377,7 +451,7 @@ def main() -> int:
         )
     log("")
 
-    log("== 4. training liveness check (both paths must train) ==")
+    log("== 5. training liveness check (both paths must train) ==")
     training = training_section(log, vocab=8192, steps=args.steps)
     log(f"  final loss gap between paths: {training['loss_gap']:.5f}")
     log("")
@@ -404,10 +478,13 @@ def main() -> int:
                 "equality_chunk_sizes": equality_chunks,
                 "training_vocab": 8192,
                 "training_steps": args.steps,
+                "token_counts": token_counts,
+                "token_vocabs": token_vocabs,
             },
         },
         "equality": equality,
         "memory": memory,
+        "token_scaling": token_rows,
         "scaling": scaling,
         "filtering": filtering,
         "training": training,

@@ -31,6 +31,12 @@ so the only per-chunk state is a ``N x chunk`` logits block plus the ``N x D``
 running ``dL/dE`` and the ``V x D`` head gradient (which is the lower bound the
 paper quotes: any implementation has to write it). The ``vjp`` also implements
 the paper's block-level gradient skipping.
+
+The chunk size is therefore the memory knob: the larger the chunk, the more of
+the logits matrix is alive at once, but the fewer graph nodes the backward pass
+has to keep. ``scripts/memory_vs_vocab.py`` measures where that trade-off
+actually lands, and the answer is not the one the paper reports - see the
+README.
 """
 
 from __future__ import annotations
@@ -145,13 +151,21 @@ def _chunked_lse(
 ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
     """``logsumexp`` over the vocabulary, one chunk at a time.
 
-    ``reduction`` selects how a chunk is summarised. All three options produce
-    the same summaries; ``"inline"`` differs only in that it merges each chunk
-    into the running accumulator before computing the next one, which is the
-    literal reading of the paper's Algorithm 2 and the lowest-memory variant.
+    ``reduction`` selects how a chunk's logits are reduced to a ``(max, sum-exp)``
+    pair:
 
-    Returns the log-sum-exp and the per-chunk summaries, which the backward
-    pass reuses to decide which chunks it can skip.
+    * ``"mlx"`` - ``mx.max`` and ``mx.sum(mx.exp(...))`` in float32.
+    * ``"fused"`` - the same reduction as a single Metal kernel per chunk
+      (:func:`cce.kernels.row_stats`); capped at ``MAX_FUSED_BLOCK`` columns.
+    * ``"inline"`` - the same reduction, and then the chunk's summary is merged
+      into the running accumulator before the next chunk is computed, which is
+      the literal reading of the paper's Algorithm 2 rather than a batch of
+      summaries merged at the end.
+
+    All three accumulate with the online log-sum-exp rule from
+    :func:`cce.ce.online_update` and produce bit-comparable results. Returns the
+    log-sum-exp and the per-chunk summaries, which the backward pass reuses to
+    decide which chunks it can skip.
     """
     if reduction not in REDUCTIONS:
         raise ValueError(f"reduction must be one of {REDUCTIONS}, got {reduction!r}")

@@ -1,0 +1,59 @@
+Cut Cross-Entropy at toy scale
+  mlx 0.32.3 on macOS-15.7.7-arm64-arm-64bit (arm64)
+  default device Device(gpu, 0), metal available True
+  model: 2 layers, d_model=64, 4 heads, d_ff=128
+  tokens per measured pass: 256 (hidden state pre-computed and detached)
+
+== 1. loss and gradient equality vs the naive path ==
+  vocab=  8192 naive loss=9.009789 head-grad norm=0.0500
+  vocab= 32768 naive loss=10.396954 head-grad norm=0.0498
+  worst |loss difference| = 0.000e+00
+  worst d(loss)/d(hidden) max|difference| = 6.985e-10
+  worst d(loss)/d(head)   max|difference| = 1.397e-09
+
+== 2. peak memory and wall clock vs vocabulary ==
+       |V|               path    peak MB  active MB        ms  vs naive peak
+      8192 naive (materialise)      31.60      31.60      4.15  1.00x
+      8192   chunked/fuse/256      72.30      11.28     32.47  2.29x
+      8192  chunked/fuse/1024      42.39      10.82     11.73  1.34x
+      8192   chunked/mlx/4096      75.83      32.80      5.24  2.40x
+     32768 naive (materialise)     119.68     119.68      7.98  1.00x
+     32768   chunked/fuse/256     186.15      26.74    117.68  1.56x
+     32768  chunked/fuse/1024     287.42      26.48     42.07  2.40x
+     32768   chunked/mlx/4096     336.46      19.01     16.41  2.81x
+     65536 naive (materialise)     237.12     170.01      9.00  1.00x
+     65536   chunked/fuse/256     514.12      71.18    214.68  2.17x
+     65536  chunked/fuse/1024     610.49      78.45     69.40  2.57x
+     65536   chunked/mlx/4096     648.55     118.10     43.79  2.74x
+    131072 naive (materialise)     472.00     203.56     24.21  1.00x
+    131072   chunked/fuse/256     668.91     103.09    432.03  1.42x
+    131072  chunked/fuse/1024    1231.97     101.19    155.24  2.61x
+    131072   chunked/mlx/4096    1241.35      34.67     87.27  2.63x
+
+               naive: |V| x16.0 -> peak x14.94 (log-log slope 0.97)
+   chunked/fused/256: |V| x16.0 -> peak x9.25 (log-log slope 0.85)
+  chunked/fused/1024: |V| x16.0 -> peak x29.06 (log-log slope 1.22)
+    chunked/mlx/4096: |V| x16.0 -> peak x16.37 (log-log slope 1.01)
+
+== 3. peak memory and wall clock vs token count ==
+  (fixed |V|; the chunked path's advantage should grow with the batch)
+  tokens=   256 |V|=  16384 logits=    16.8 MB  naive     61.0 MB      3.4 ms  chunked     68.1 MB     28.2 ms  ratio 1.12x
+  tokens=   256 |V|=  65536 logits=    67.1 MB  naive    237.1 MB     11.4 ms  chunked    634.1 MB     59.0 ms  ratio 2.67x
+  tokens=  2048 |V|=  16384 logits=   134.2 MB  naive    416.4 MB     18.0 ms  chunked    634.3 MB     36.4 ms  ratio 1.52x
+  tokens=  2048 |V|=  65536 logits=   536.9 MB  naive   1662.1 MB     75.3 ms  chunked   1267.1 MB    158.1 ms  ratio 0.76x
+  tokens=  8192 |V|=  16384 logits=   536.9 MB  naive   1627.7 MB     85.3 ms  chunked   1835.8 MB    143.0 ms  ratio 1.13x
+  tokens=  8192 |V|=  65536 logits=  2147.5 MB  naive   6497.2 MB    337.2 ms  chunked   2596.7 MB    550.1 ms  ratio 0.40x
+
+== 4. gradient filtering (paper Section 4.2) ==
+  threshold= 0.000e+00  loss diff=0.00e+00  grad(hidden) diff=0.00e+00  grad(head) diff=0.00e+00  blocks skipped=  0.0%
+  threshold= 1.000e-08  loss diff=0.00e+00  grad(hidden) diff=0.00e+00  grad(head) diff=0.00e+00  blocks skipped=  0.0%
+  threshold= 1.000e-06  loss diff=0.00e+00  grad(hidden) diff=0.00e+00  grad(head) diff=0.00e+00  blocks skipped=  0.0%
+  threshold= 2.441e-04  loss diff=0.00e+00  grad(hidden) diff=1.53e-06  grad(head) diff=1.53e-03  blocks skipped=100.0%
+  threshold= 1.000e-03  loss diff=0.00e+00  grad(hidden) diff=1.53e-06  grad(head) diff=1.53e-03  blocks skipped=100.0%
+
+== 5. training liveness check (both paths must train) ==
+  naive    loss   9.0206 ->   1.1921 (last 10 mean   1.7244 +- 0.3379,   1.1s)
+  chunked  loss   9.0206 ->   1.1931 (last 10 mean   1.7244 +- 0.3377,   0.9s)
+  final loss gap between paths: 0.00093
+
+wrote results/memory_vs_vocab.json
