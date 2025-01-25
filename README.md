@@ -91,7 +91,7 @@ token would sit at `log 4096 = 8.32` (measured, `results/run_log.txt`).
 
 ## Checks
 
-`pytest` runs 88 tests. The ones that matter most:
+`pytest` runs 87 tests. The ones that matter most:
 
 - **The chunked path's gradients equal the naive path's** across chunk sizes,
   vocabularies and all three reductions, to `<= 1e-5`; measured worst case
