@@ -92,7 +92,3 @@ class TinyLM(nn.Module):
     @property
     def n_params(self) -> int:
         return sum(v.size for _, v in nn.utils.tree_flatten(self.parameters()))
-
-
-class ConfigSmall(Config):
-    pass

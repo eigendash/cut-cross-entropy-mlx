@@ -173,6 +173,12 @@ chunked/mlx/4096 `1.01`.
 | 8192 | 16384 | 536.9 MB | 1627.7 MB | 85.3 | 1835.8 MB | 143.0 | 1.13x |
 | 8192 | 65536 | 2147.5 MB | 6497.2 MB | 337.2 | 2596.7 MB | 550.1 | **0.40x** |
 
+(Peak MB values above are rounded to one decimal place to match
+`results/run_log.txt`; the unrounded values in `results/memory_vs_vocab.json`
+are 60.96/68.08 (256 tokens, 16k), 237.12/634.09 (256, 64k), 416.35/634.30
+(2048, 16k), 1662.06/1267.09 (2048, 64k), 1627.65/1835.84 (8192, 16k) and
+6497.24/2596.72 MB (8192, 64k), in naive/chunked order. Wall clocks are in ms.)
+
 **Gradient filtering** at 256 tokens and `|V| = 32768`, chunk size 256 (128
 blocks). This toy task is unusually peaked, so 100% of blocks fall below the
 bfloat16 threshold:
