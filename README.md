@@ -12,12 +12,17 @@ reports reducing the loss computation's memory from 24 GB to 1 MB for Gemma 2
 (2B), and speeding up the backward pass 3.5x by skipping vocabulary blocks whose
 softmax weights are all below bfloat16 precision.
 
-This is not a reproduction. It is a few hundred thousand parameters on a
-synthetic task at vocabularies up to 131k, it has no CUDA and no Triton, and
-none of its numbers are comparable to the paper's. What it does do is implement
+This is not a reproduction. The model is 74k backbone parameters plus 8.4M of
+embedding and classifier at `|V| = 65536`, trained on a synthetic task with
+vocabularies up to 131k; there is no CUDA and no Triton, and none of its numbers
+are comparable to the paper's. What it does do is implement
 the mechanism so that the chunked path is bit-comparable to the naive one, and
 then measure peak memory honestly — including the case where the answer is not
-the one the paper reports.
+the one the paper reports. The short version: the chunked path reproduces the
+naive loss and both gradients to within `7e-10`, and at 8192 tokens with a 64k
+vocabulary it peaks at 2.60 GB against the naive path's 6.50 GB — but below
+about 2048 tokens it is *worse* than the naive path, and peak memory is not flat
+in vocabulary size.
 
 ## What is in here
 
@@ -45,7 +50,12 @@ chunk, and the threadgroups merging partials with the same online rule. That
 single pass is what makes the second pass of "find the global max, then sum
 `exp(x - max)`" unnecessary. It is written for blocks of at most 1024 columns
 (`LSE_THREADGROUP`), and an all-`-inf` row comes back as `(-inf, 0)` rather than
-`nan`. `col_sum` is the axis-0 reduction the backward pass would need if the weight gradient were accumulated column-wise; the shipped backward uses MLX's own matmul for that sum.
+`nan`.
+
+`col_sum` is the axis-0 reduction the backward pass would need if the weight
+gradient were accumulated column-wise; the shipped backward uses MLX's own
+matmul for that sum, and the kernel is kept and tested because it is the other
+half of Algorithm 3.
 
 **The chunked linear + cross-entropy operator** (`cce/linear_ce.py`). This is the
 paper's `C^T E` without the materialisation: `E @ C_c^T` is built for one
@@ -227,11 +237,13 @@ bfloat16 threshold:
   are skipped at the bfloat16 threshold on this task, and the loss is unchanged,
   but the wall-clock column for filtering is not reported because the remaining
   gathered term and the per-chunk work dominate at this size.
-- Both paths use several times the raw logits matrix in peak memory (2.9x to
-  3.0x for naive at these sizes), because autodiff keeps the softmax alive for
-  the backward pass. Nothing here is a small-memory implementation of
-  cross-entropy; it is a comparison of two implementations under the same
-  autodiff.
+- Peak memory is several times the raw logits matrix, not a fraction of it:
+  naive uses 3.63x, 3.53x, 3.10x and 3.03x of `N x |V| x 4` bytes at
+  (256, 16k), (256, 64k), (2048, 64k) and (8192, 64k); chunked is 4.06x, 9.45x,
+  2.36x and 1.21x at the same four points, i.e. its overhead shrinks towards the
+  1x floor the paper describes as the batch grows. Nothing here is a small-memory
+  implementation of cross-entropy; it is a comparison of two implementations
+  under the same autodiff.
 
 ## Where this may differ from the paper
 
@@ -265,8 +277,9 @@ bfloat16 threshold:
 - **The classifier head is not tied to the embedding and the model is not
   otherwise the paper's.** The paper measures on Gemma 2 (2B), Phi 3.5 Mini,
   Qwen 2.5 7B and Mistral NeMo with vocabularies of 32k-256k and hidden sizes of
-  2304-3584. This is `d_model=64` with two layers, so the `|V|/D` ratio is 30x
-  larger than the paper's, which flatters the chunked path's arithmetic and
+  2304-3584, i.e. `|V|/D` between 14 and 111. This is `d_model=64`, so `|V|/D` is
+  1024 at `|V| = 65536` — 9x to 73x larger, which flatters the chunked path's
+  arithmetic (the chunked matmul is `N x chunk x D`, so a small `D` is cheap) and
   ignores every memory cost that is not the logits.
 - **The synthetic task makes gradient filtering look better than it is.** The
   task's next-token distribution has 64 support tokens, so the softmax collapses
