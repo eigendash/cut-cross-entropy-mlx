@@ -209,10 +209,10 @@ def test_extreme_logits_are_stable(reduction):
     head = mx.array(rng.normal(size=(v, d)).astype(np.float32))
     targets = mx.array([0, 255, 511], mx.int32)
     scale = (mx.arange(v) % 2) * 2e3 - 1e3
-    head = head + scale[:, None] * 0.5
+    head = head + scale[:, None] * 2.0
 
     logits = np.array(hidden) @ np.array(head).T
-    assert np.abs(logits).max() > 1e2
+    assert np.abs(logits).max() > 1e3
     z = logits.astype(np.float64)
     m = z.max(axis=1, keepdims=True)
     want = (np.log(np.exp(z - m).sum(axis=1)) + m[:, 0] - z[np.arange(n), np.array(targets)]).mean()
